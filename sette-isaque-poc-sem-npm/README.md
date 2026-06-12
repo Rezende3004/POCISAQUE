@@ -255,3 +255,17 @@ Quando o valor estiver vazio, a API cria um UUID e o devolve:
 ```
 
 O cliente da API deve salvar o ID e reenviá-lo nos próximos turnos.
+
+
+# Externalização maior do OPA
+
+Novas rotas:
+
+```text
+POST /api/opa/resolver-atendimento
+POST /api/opa/testar-envio-direto
+POST /api/opa/externalizar
+```
+
+A rota `/api/opa/externalizar` gera a resposta e a envia diretamente pelo
+endpoint oficial `/api/v1/atendimento/mensagem/send`.

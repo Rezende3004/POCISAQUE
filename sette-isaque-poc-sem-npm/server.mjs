@@ -1,5 +1,7 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
+import http from "node:http";
+import https from "node:https";
 
 const PORT = Number(process.env.PORT || 3000);
 const API_TEST_KEY = process.env.API_TEST_KEY?.trim() || "";
@@ -12,6 +14,16 @@ const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 1_000_000);
 const STATE_TTL_MS = Number(process.env.STATE_TTL_MS || 21_600_000); // 6 horas
 const IDEMPOTENCY_TTL_MS = Number(process.env.IDEMPOTENCY_TTL_MS || 86_400_000); // 24 horas
 const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 120);
+
+const OPA_BASE_URL = (process.env.OPA_BASE_URL?.trim() || "").replace(/\/+$/, "");
+const OPA_API_TOKEN = process.env.OPA_API_TOKEN?.trim() || "";
+const OPA_DELIVERY_MODE = (
+  process.env.OPA_DELIVERY_MODE?.trim().toLowerCase() || "mock"
+);
+const OPA_TIMEOUT_MS = Number(process.env.OPA_TIMEOUT_MS || 15_000);
+const OPA_DEFAULT_TEST_MESSAGE =
+  process.env.OPA_DEFAULT_TEST_MESSAGE?.trim() ||
+  "Mensagem de teste enviada diretamente pela API externa do Isaque.";
 
 const ISAQUE_INSTRUCTIONS = `
 Você é Isaque, do suporte técnico da SETTE Fibra.
@@ -162,6 +174,292 @@ function extractResponseText(data) {
   }
 
   return parts.join("\n").trim();
+}
+
+
+function opaConfigured() {
+  return Boolean(OPA_BASE_URL && OPA_API_TOKEN);
+}
+
+function opaHeaders(extra = {}) {
+  return {
+    Authorization: `Bearer ${OPA_API_TOKEN}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    ...extra
+  };
+}
+
+function requestJson(method, targetUrl, body = undefined, headers = {}) {
+  return new Promise((resolve, reject) => {
+    let url;
+
+    try {
+      url = new URL(targetUrl);
+    } catch {
+      const error = new Error("OPA_INVALID_BASE_URL");
+      error.code = "OPA_INVALID_BASE_URL";
+      reject(error);
+      return;
+    }
+
+    const transport = url.protocol === "https:" ? https : http;
+    const payload =
+      body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8");
+
+    const requestHeaders = {
+      ...headers
+    };
+
+    if (payload) {
+      requestHeaders["Content-Length"] = String(payload.length);
+    }
+
+    const request = transport.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method,
+        headers: requestHeaders,
+        timeout: OPA_TIMEOUT_MS
+      },
+      (response) => {
+        const chunks = [];
+
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8").trim();
+          let data = {};
+
+          if (raw) {
+            try {
+              data = JSON.parse(raw);
+            } catch {
+              data = { raw };
+            }
+          }
+
+          resolve({
+            ok:
+              response.statusCode !== undefined &&
+              response.statusCode >= 200 &&
+              response.statusCode < 300,
+            status: response.statusCode || 0,
+            data
+          });
+        });
+      }
+    );
+
+    request.on("timeout", () => {
+      request.destroy();
+      const error = new Error("OPA_REQUEST_TIMEOUT");
+      error.code = "OPA_REQUEST_TIMEOUT";
+      reject(error);
+    });
+
+    request.on("error", (cause) => {
+      if (cause?.code === "OPA_REQUEST_TIMEOUT") {
+        reject(cause);
+        return;
+      }
+
+      const error = new Error(cause?.message || "OPA_NETWORK_ERROR");
+      error.code = "OPA_NETWORK_ERROR";
+      error.cause = cause;
+      reject(error);
+    });
+
+    if (payload) request.write(payload);
+    request.end();
+  });
+}
+
+async function opaRequest(method, path, body = undefined) {
+  if (!opaConfigured()) {
+    const error = new Error("OPA_NOT_CONFIGURED");
+    error.code = "OPA_NOT_CONFIGURED";
+    throw error;
+  }
+
+  const response = await requestJson(
+    method,
+    `${OPA_BASE_URL}${path}`,
+    body,
+    opaHeaders()
+  );
+
+  if (!response.ok) {
+    const detail =
+      response.data?.message ||
+      response.data?.error ||
+      response.data?.status ||
+      `HTTP ${response.status}`;
+
+    const error = new Error(String(detail));
+    error.code = "OPA_REQUEST_FAILED";
+    error.httpStatus = response.status;
+    error.opaResponse = response.data;
+    throw error;
+  }
+
+  return response.data;
+}
+
+function getOpaCustomerServiceId(body) {
+  return (
+    cleanString(body.opa_customer_service_id, 200) ||
+    cleanString(body.opaCustomerServiceId, 200) ||
+    cleanString(body.customerServiceId, 200) ||
+    cleanString(body.id_rota, 200) ||
+    cleanString(body.opa_atendimento_id, 200) ||
+    ""
+  );
+}
+
+function getOpaProtocol(body) {
+  return (
+    cleanString(body.opa_protocolo, 200) ||
+    cleanString(body.opaProtocol, 200) ||
+    cleanString(body.protocolo, 200) ||
+    ""
+  );
+}
+
+async function findOpaAttendanceByProtocol(protocol) {
+  const response = await opaRequest("GET", "/api/v1/atendimento", {
+    filter: { protocolo: protocol },
+    options: { limit: 2 }
+  });
+
+  const records = Array.isArray(response?.data) ? response.data : [];
+  const exactMatches = records.filter(
+    (item) => cleanString(item?.protocolo, 200) === protocol
+  );
+
+  if (exactMatches.length === 0) {
+    const error = new Error("OPA_ATTENDANCE_NOT_FOUND");
+    error.code = "OPA_ATTENDANCE_NOT_FOUND";
+    throw error;
+  }
+
+  if (exactMatches.length > 1) {
+    const error = new Error("OPA_ATTENDANCE_AMBIGUOUS");
+    error.code = "OPA_ATTENDANCE_AMBIGUOUS";
+    throw error;
+  }
+
+  const record = exactMatches[0];
+  const customerServiceId = cleanString(record?._id, 200);
+
+  if (!customerServiceId) {
+    const error = new Error("OPA_ATTENDANCE_WITHOUT_ID");
+    error.code = "OPA_ATTENDANCE_WITHOUT_ID";
+    throw error;
+  }
+
+  return {
+    customerServiceId,
+    protocol: cleanString(record?.protocolo, 200),
+    status: cleanString(record?.status, 50),
+    channel: cleanString(record?.canal, 100)
+  };
+}
+
+async function resolveOpaAttendance(body) {
+  const directId = getOpaCustomerServiceId(body);
+
+  if (directId) {
+    return {
+      customerServiceId: directId,
+      protocol: getOpaProtocol(body) || null,
+      status: null,
+      channel: null,
+      source: "request"
+    };
+  }
+
+  const protocol = getOpaProtocol(body);
+
+  if (!protocol) {
+    const error = new Error("OPA_ATTENDANCE_REFERENCE_REQUIRED");
+    error.code = "OPA_ATTENDANCE_REFERENCE_REQUIRED";
+    throw error;
+  }
+
+  const found = await findOpaAttendanceByProtocol(protocol);
+  return {
+    ...found,
+    source: "protocol_lookup"
+  };
+}
+
+async function sendOpaText(customerServiceId, text) {
+  const response = await opaRequest(
+    "POST",
+    "/api/v1/atendimento/mensagem/send",
+    {
+      customerServiceId,
+      content: {
+        type: "text",
+        text
+      }
+    }
+  );
+
+  const success =
+    response?.status === "success" &&
+    Number(response?.code) >= 200 &&
+    Number(response?.code) < 300;
+
+  if (!success) {
+    const error = new Error("OPA_SEND_NOT_CONFIRMED");
+    error.code = "OPA_SEND_NOT_CONFIRMED";
+    error.opaResponse = response;
+    throw error;
+  }
+
+  return {
+    opaMessageId:
+      typeof response?.data === "string"
+        ? response.data
+        : cleanString(response?.data?._id, 200) || null,
+    rawStatus: response?.status || null,
+    rawCode: response?.code || null
+  };
+}
+
+async function deliverOpaText(body, text) {
+  const attendance = await resolveOpaAttendance(body);
+
+  if (OPA_DELIVERY_MODE !== "opa") {
+    return {
+      mode: "mock",
+      sent: false,
+      simulated: true,
+      customer_service_id: attendance.customerServiceId,
+      protocol: attendance.protocol,
+      attendance_source: attendance.source,
+      opa_message_id: null,
+      text_preview: text
+    };
+  }
+
+  const sent = await sendOpaText(attendance.customerServiceId, text);
+
+  return {
+    mode: "opa",
+    sent: true,
+    simulated: false,
+    customer_service_id: attendance.customerServiceId,
+    protocol: attendance.protocol,
+    attendance_source: attendance.source,
+    opa_message_id: sent.opaMessageId,
+    opa_status: sent.rawStatus,
+    opa_code: sent.rawCode
+  };
 }
 
 async function openAIRequest(message, previousResponseId = "") {
@@ -472,17 +770,14 @@ function getIncomingMessage(body) {
 
 function getConversationKey(body) {
   return (
-    cleanString(body.customerServiceId, 200) ||
-    cleanString(body.customer_service_id, 200) ||
     cleanString(body.conversationId, 200) ||
     cleanString(body.conversation_id, 200) ||
     cleanString(body.conversationKey, 200) ||
-    cleanString(body.id_rota, 200) ||
+    cleanString(body.customer_service_id, 200) ||
     cleanString(body.idAtendimento, 200) ||
     cleanString(body.id_atendimento, 200) ||
     cleanString(body.atendimentoId, 200) ||
     cleanString(body.atendimento_id, 200) ||
-    cleanString(body.protocolo, 200) ||
     ""
   );
 }
@@ -726,6 +1021,83 @@ async function processIsaqueBody(body, minimal = false) {
   };
 }
 
+
+function opaErrorResponse(error) {
+  const publicErrors = {
+    OPA_NOT_CONFIGURED: {
+      status: 503,
+      message:
+        "A integração oficial com o OPA ainda não foi configurada no servidor."
+    },
+    OPA_INVALID_BASE_URL: {
+      status: 500,
+      message: "A URL configurada para o OPA é inválida."
+    },
+    OPA_REQUEST_TIMEOUT: {
+      status: 504,
+      message: "O OPA não respondeu dentro do tempo limite."
+    },
+    OPA_NETWORK_ERROR: {
+      status: 502,
+      message: "Não foi possível conectar à API oficial do OPA."
+    },
+    OPA_REQUEST_FAILED: {
+      status: 502,
+      message: "A API oficial do OPA recusou ou não concluiu a requisição."
+    },
+    OPA_ATTENDANCE_REFERENCE_REQUIRED: {
+      status: 400,
+      message:
+        "Envie opa_customer_service_id ou opa_protocolo para identificar o atendimento."
+    },
+    OPA_ATTENDANCE_NOT_FOUND: {
+      status: 404,
+      message: "Nenhum atendimento foi localizado com o protocolo informado."
+    },
+    OPA_ATTENDANCE_AMBIGUOUS: {
+      status: 409,
+      message:
+        "Mais de um atendimento foi localizado e não foi possível selecionar com segurança."
+    },
+    OPA_ATTENDANCE_WITHOUT_ID: {
+      status: 502,
+      message: "O atendimento retornado pelo OPA não possui um ID válido."
+    },
+    OPA_SEND_NOT_CONFIRMED: {
+      status: 502,
+      message: "O OPA não confirmou o envio da mensagem."
+    }
+  };
+
+  const selected = publicErrors[error?.code];
+
+  if (selected) {
+    return {
+      status: selected.status,
+      payload: {
+        success: false,
+        code: error.code,
+        message: selected.message
+      }
+    };
+  }
+
+  console.error("Erro OPA não tratado:", {
+    code: error?.code || "UNKNOWN",
+    status: error?.httpStatus || null,
+    message: error?.message
+  });
+
+  return {
+    status: 500,
+    payload: {
+      success: false,
+      code: error?.code || "OPA_UNKNOWN_ERROR",
+      message: "Não foi possível concluir a integração com o OPA."
+    }
+  };
+}
+
 function isaqueErrorResponse(error) {
   if (error.name === "AbortError") {
     return {
@@ -792,10 +1164,12 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/health") {
     return sendJson(res, 200, {
       status: "ok",
-      service: "sette-isaque-loop-v5-conversation-id",
+      service: "sette-isaque-loop-v6-externalizacao-opa",
       ai_mode: AI_MODE,
       openai_configured: Boolean(OPENAI_API_KEY),
-      active_conversations: conversationStates.size
+      active_conversations: conversationStates.size,
+      opa_delivery_mode: OPA_DELIVERY_MODE,
+      opa_configured: opaConfigured()
     });
   }
 
@@ -849,6 +1223,143 @@ const server = createServer(async (req, res) => {
       });
     } catch (error) {
       const response = bodyErrorResponse(error);
+      return sendJson(res, response.status, response.payload);
+    }
+  }
+
+
+  if (
+    req.method === "POST" &&
+    url.pathname === "/api/opa/resolver-atendimento"
+  ) {
+    try {
+      const body = await readJsonBody(req);
+      const attendance = await resolveOpaAttendance(body);
+
+      return sendJson(res, 200, {
+        success: true,
+        customer_service_id: attendance.customerServiceId,
+        protocol: attendance.protocol,
+        status: attendance.status,
+        channel: attendance.channel,
+        source: attendance.source
+      });
+    } catch (error) {
+      if (error.code === "BODY_TOO_LARGE" || error.code === "INVALID_JSON") {
+        const response = bodyErrorResponse(error);
+        return sendJson(res, response.status, response.payload);
+      }
+
+      const response = opaErrorResponse(error);
+      return sendJson(res, response.status, response.payload);
+    }
+  }
+
+  if (
+    req.method === "POST" &&
+    url.pathname === "/api/opa/testar-envio-direto"
+  ) {
+    try {
+      const body = await readJsonBody(req);
+      const text =
+        cleanMessage(body.text) ||
+        cleanMessage(body.mensagem) ||
+        OPA_DEFAULT_TEST_MESSAGE;
+
+      const delivery = await deliverOpaText(body, text);
+
+      return sendJson(res, 200, {
+        success: true,
+        delivery
+      });
+    } catch (error) {
+      if (error.code === "BODY_TOO_LARGE" || error.code === "INVALID_JSON") {
+        const response = bodyErrorResponse(error);
+        return sendJson(res, response.status, response.payload);
+      }
+
+      const response = opaErrorResponse(error);
+      return sendJson(res, response.status, response.payload);
+    }
+  }
+
+  if (
+    req.method === "POST" &&
+    url.pathname === "/api/opa/externalizar"
+  ) {
+    try {
+      const body = await readJsonBody(req);
+
+      // Primeiro valida/localiza o atendimento. Assim o contexto da IA não
+      // avança quando não há como entregar a resposta.
+      const attendance = await resolveOpaAttendance(body);
+
+      const aiResult = await processIsaqueBody(body, false);
+
+      if (aiResult.status < 200 || aiResult.status >= 300) {
+        return sendJson(res, aiResult.status, aiResult.payload);
+      }
+
+      const reply = cleanMessage(aiResult.payload?.reply);
+
+      if (!reply) {
+        return sendJson(res, 502, {
+          success: false,
+          code: "EMPTY_GENERATED_REPLY",
+          message: "A IA não retornou uma mensagem válida para envio."
+        });
+      }
+
+      let delivery;
+
+      if (OPA_DELIVERY_MODE === "opa") {
+        const sent = await sendOpaText(attendance.customerServiceId, reply);
+        delivery = {
+          mode: "opa",
+          sent: true,
+          simulated: false,
+          customer_service_id: attendance.customerServiceId,
+          protocol: attendance.protocol,
+          attendance_source: attendance.source,
+          opa_message_id: sent.opaMessageId,
+          opa_status: sent.rawStatus,
+          opa_code: sent.rawCode
+        };
+      } else {
+        delivery = {
+          mode: "mock",
+          sent: false,
+          simulated: true,
+          customer_service_id: attendance.customerServiceId,
+          protocol: attendance.protocol,
+          attendance_source: attendance.source,
+          opa_message_id: null,
+          text_preview: reply
+        };
+      }
+
+      return sendJson(res, 200, {
+        success: true,
+        conversation_id: aiResult.payload.conversation_id,
+        conversation_created:
+          aiResult.payload.conversation_created === true,
+        reply_dispatched: delivery.sent,
+        delivery
+      });
+    } catch (error) {
+      if (error.code === "BODY_TOO_LARGE" || error.code === "INVALID_JSON") {
+        const response = bodyErrorResponse(error);
+        return sendJson(res, response.status, response.payload);
+      }
+
+      if (
+        String(error?.code || "").startsWith("OPA_")
+      ) {
+        const response = opaErrorResponse(error);
+        return sendJson(res, response.status, response.payload);
+      }
+
+      const response = isaqueErrorResponse(error);
       return sendJson(res, response.status, response.payload);
     }
   }
@@ -908,12 +1419,15 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`SETTE Isaque Loop v5 rodando na porta ${PORT}`);
+  console.log(`SETTE Isaque Loop v6 rodando na porta ${PORT}`);
   console.log(`Modo de IA: ${AI_MODE}`);
   console.log(`Health: http://localhost:${PORT}/health`);
   console.log(`Teste fixo: POST http://localhost:${PORT}/api/teste-opa`);
   console.log(`Diagnóstico OPA: POST http://localhost:${PORT}/api/opa/diagnostico`);
   console.log(`Resposta simples OPA: POST http://localhost:${PORT}/api/opa/responder`);
+  console.log(`Resolver atendimento: POST http://localhost:${PORT}/api/opa/resolver-atendimento`);
+  console.log(`Teste envio direto: POST http://localhost:${PORT}/api/opa/testar-envio-direto`);
+  console.log(`Externalizar: POST http://localhost:${PORT}/api/opa/externalizar`);
   console.log(`Responder: POST http://localhost:${PORT}/api/isaque/responder`);
   console.log(`Reset: POST http://localhost:${PORT}/api/isaque/reset`);
 });

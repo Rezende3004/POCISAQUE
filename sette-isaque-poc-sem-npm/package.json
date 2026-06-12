@@ -1,10 +1,10 @@
 {
-  "name": "sette-isaque-loop-v5",
-  "version": "5.0.0",
+  "name": "sette-isaque-loop-v6",
+  "version": "6.0.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": "24.x"
   },
-  "description": "POC sem dependências com conversation_id gerado pela própria API."
+  "description": "POC sem dependências com resposta enviada diretamente pela API oficial do OPA."
 }
