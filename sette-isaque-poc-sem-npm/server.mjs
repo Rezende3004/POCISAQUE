@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3000);
 const API_TEST_KEY = process.env.API_TEST_KEY?.trim() || "";
@@ -571,6 +572,11 @@ function bodyErrorResponse(error) {
 function minimalOpaResponse(payload) {
   return {
     success: payload.success === true,
+    conversation_id:
+      cleanString(payload.conversation_id, 200) ||
+      cleanString(payload.customer_service_id, 200) ||
+      null,
+    conversation_created: payload.conversation_created === true,
     reply: typeof payload.reply === "string" ? payload.reply : null
   };
 }
@@ -581,7 +587,7 @@ async function processIsaqueBody(body, minimal = false) {
     cleanString(body.sender, 50).toLowerCase() ||
     cleanString(body.remetente, 50).toLowerCase() ||
     "customer";
-  const conversationKey = getConversationKey(body);
+  const receivedConversationKey = getConversationKey(body);
   const messageId = getMessageId(body);
   const requestedPreviousResponseId = getPreviousResponseId(body);
   const reset = body.reset === true || body.reset === "true";
@@ -599,10 +605,15 @@ async function processIsaqueBody(body, minimal = false) {
     };
   }
 
+  const conversationKey = receivedConversationKey || randomUUID();
+  const conversationCreated = !receivedConversationKey;
+
   if (sender !== "customer" && sender !== "client" && sender !== "cliente") {
     const ignored = {
       success: true,
       ignored: true,
+      conversation_id: conversationKey,
+      conversation_created: conversationCreated,
       reply: null,
       reason: "A mensagem não foi identificada como enviada pelo cliente.",
       sender
@@ -645,9 +656,11 @@ async function processIsaqueBody(body, minimal = false) {
 
       const response = {
         success: true,
+        conversation_id: conversationKey,
+        conversation_created: conversationCreated,
         reply: aiResult.reply,
         response_id: aiResult.responseId || null,
-        customer_service_id: conversationKey || null,
+        customer_service_id: receivedConversationKey || null,
         message_id: messageId || null,
         duplicate: false,
         ai_mode: "openai",
@@ -677,9 +690,11 @@ async function processIsaqueBody(body, minimal = false) {
 
     const response = {
       success: true,
+      conversation_id: conversationKey,
+      conversation_created: conversationCreated,
       reply: mockResult.reply,
       response_id: null,
-      customer_service_id: conversationKey || null,
+      customer_service_id: receivedConversationKey || null,
       message_id: messageId || null,
       duplicate: false,
       ai_mode: "mock",
@@ -777,7 +792,7 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/health") {
     return sendJson(res, 200, {
       status: "ok",
-      service: "sette-isaque-loop-v4-opa-responder",
+      service: "sette-isaque-loop-v5-conversation-id",
       ai_mode: AI_MODE,
       openai_configured: Boolean(OPENAI_API_KEY),
       active_conversations: conversationStates.size
@@ -893,7 +908,7 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`SETTE Isaque Loop v4 rodando na porta ${PORT}`);
+  console.log(`SETTE Isaque Loop v5 rodando na porta ${PORT}`);
   console.log(`Modo de IA: ${AI_MODE}`);
   console.log(`Health: http://localhost:${PORT}/health`);
   console.log(`Teste fixo: POST http://localhost:${PORT}/api/teste-opa`);

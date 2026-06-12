@@ -228,3 +228,30 @@ Retorno mínimo:
 ```
 
 A rota também aceita os campos `message`, `mensagem`, `mensagem_candidata`, `text` e `texto`.
+
+
+# Conversation ID gerado pela API
+
+A rota `POST /api/opa/responder` agora aceita `conversation_id` opcional.
+
+Body:
+
+```json
+{
+  "mensagem_cliente": "minha internet caiu",
+  "conversation_id": ""
+}
+```
+
+Quando o valor estiver vazio, a API cria um UUID e o devolve:
+
+```json
+{
+  "success": true,
+  "conversation_id": "UUID",
+  "conversation_created": true,
+  "reply": "..."
+}
+```
+
+O cliente da API deve salvar o ID e reenviá-lo nos próximos turnos.
