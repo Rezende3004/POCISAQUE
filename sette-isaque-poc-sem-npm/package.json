@@ -1,0 +1,10 @@
+{
+  "name": "sette-isaque-poc-sem-npm",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "description": "POC sem dependências para testar Opa Suite e IA externa."
+}
