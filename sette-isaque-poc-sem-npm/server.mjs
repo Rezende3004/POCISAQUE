@@ -457,17 +457,44 @@ function buildOpaDiagnostic(body) {
   };
 }
 
+function getIncomingMessage(body) {
+  return (
+    cleanMessage(body.message) ||
+    cleanMessage(body.mensagem_cliente) ||
+    cleanMessage(body.mensagem) ||
+    cleanMessage(body.mensagem_candidata) ||
+    cleanMessage(body.text) ||
+    cleanMessage(body.texto) ||
+    ""
+  );
+}
+
 function getConversationKey(body) {
   return (
     cleanString(body.customerServiceId, 200) ||
     cleanString(body.customer_service_id, 200) ||
+    cleanString(body.conversationId, 200) ||
+    cleanString(body.conversation_id, 200) ||
     cleanString(body.conversationKey, 200) ||
+    cleanString(body.id_rota, 200) ||
+    cleanString(body.idAtendimento, 200) ||
+    cleanString(body.id_atendimento, 200) ||
+    cleanString(body.atendimentoId, 200) ||
+    cleanString(body.atendimento_id, 200) ||
+    cleanString(body.protocolo, 200) ||
     ""
   );
 }
 
 function getMessageId(body) {
-  return cleanString(body.messageId, 200) || cleanString(body.message_id, 200);
+  return (
+    cleanString(body.messageId, 200) ||
+    cleanString(body.message_id, 200) ||
+    cleanString(body.id_mensagem, 200) ||
+    cleanString(body.mensagem_id, 200) ||
+    cleanString(body._id, 200) ||
+    ""
+  );
 }
 
 function getPreviousResponseId(body) {
@@ -540,6 +567,203 @@ function bodyErrorResponse(error) {
   };
 }
 
+
+function minimalOpaResponse(payload) {
+  return {
+    success: payload.success === true,
+    reply: typeof payload.reply === "string" ? payload.reply : null
+  };
+}
+
+async function processIsaqueBody(body, minimal = false) {
+  const message = getIncomingMessage(body);
+  const sender =
+    cleanString(body.sender, 50).toLowerCase() ||
+    cleanString(body.remetente, 50).toLowerCase() ||
+    "customer";
+  const conversationKey = getConversationKey(body);
+  const messageId = getMessageId(body);
+  const requestedPreviousResponseId = getPreviousResponseId(body);
+  const reset = body.reset === true || body.reset === "true";
+
+  if (!message) {
+    return {
+      status: 400,
+      payload: {
+        success: false,
+        reply: null,
+        code: "MESSAGE_REQUIRED",
+        message:
+          'Envie a mensagem em "message", "mensagem_cliente", "mensagem" ou "mensagem_candidata".'
+      }
+    };
+  }
+
+  if (sender !== "customer" && sender !== "client" && sender !== "cliente") {
+    const ignored = {
+      success: true,
+      ignored: true,
+      reply: null,
+      reason: "A mensagem não foi identificada como enviada pelo cliente.",
+      sender
+    };
+
+    return {
+      status: 200,
+      payload: minimal ? minimalOpaResponse(ignored) : ignored
+    };
+  }
+
+  if (messageId && processedMessages.has(messageId)) {
+    const cached = processedMessages.get(messageId);
+    const duplicate = {
+      ...cached.response,
+      duplicate: true
+    };
+
+    return {
+      status: 200,
+      payload: minimal ? minimalOpaResponse(duplicate) : duplicate
+    };
+  }
+
+  const result = await runSerialized(conversationKey, async () => {
+    if (reset && conversationKey) {
+      conversationStates.delete(conversationKey);
+    }
+
+    const currentState = conversationKey
+      ? conversationStates.get(conversationKey) || {}
+      : {};
+
+    if (AI_MODE === "openai") {
+      const previousResponseId =
+        requestedPreviousResponseId ||
+        cleanString(currentState.previousResponseId, 200);
+
+      const aiResult = await askOpenAI(message, previousResponseId);
+
+      const response = {
+        success: true,
+        reply: aiResult.reply,
+        response_id: aiResult.responseId || null,
+        customer_service_id: conversationKey || null,
+        message_id: messageId || null,
+        duplicate: false,
+        ai_mode: "openai",
+        context_source: requestedPreviousResponseId
+          ? "request"
+          : previousResponseId
+            ? "server_memory"
+            : "new",
+        context_reset: aiResult.contextReset,
+        model: aiResult.model
+      };
+
+      if (conversationKey) {
+        conversationStates.set(conversationKey, {
+          previousResponseId: aiResult.responseId,
+          updatedAt: Date.now()
+        });
+      }
+
+      return response;
+    }
+
+    const mockResult = mockAI(
+      message,
+      cleanString(currentState.mockStage, 100)
+    );
+
+    const response = {
+      success: true,
+      reply: mockResult.reply,
+      response_id: null,
+      customer_service_id: conversationKey || null,
+      message_id: messageId || null,
+      duplicate: false,
+      ai_mode: "mock",
+      category: mockResult.category,
+      stage: mockResult.stage,
+      context_source: conversationKey ? "server_memory" : "stateless"
+    };
+
+    if (conversationKey) {
+      conversationStates.set(conversationKey, {
+        mockStage: mockResult.stage,
+        updatedAt: Date.now()
+      });
+    }
+
+    return response;
+  });
+
+  if (messageId) {
+    processedMessages.set(messageId, {
+      response: result,
+      expiresAt: Date.now() + IDEMPOTENCY_TTL_MS
+    });
+  }
+
+  return {
+    status: 200,
+    payload: minimal ? minimalOpaResponse(result) : result
+  };
+}
+
+function isaqueErrorResponse(error) {
+  if (error.name === "AbortError") {
+    return {
+      status: 504,
+      payload: {
+        success: false,
+        reply: null,
+        code: "OPENAI_TIMEOUT",
+        message: "A IA demorou mais que o limite configurado."
+      }
+    };
+  }
+
+  if (error.code === "OPENAI_API_KEY_NOT_CONFIGURED") {
+    return {
+      status: 503,
+      payload: {
+        success: false,
+        reply: null,
+        code: error.code,
+        message: "A chave da OpenAI ainda não foi configurada no servidor."
+      }
+    };
+  }
+
+  if (error.code === "BODY_TOO_LARGE" || error.code === "INVALID_JSON") {
+    const response = bodyErrorResponse(error);
+    return {
+      status: response.status,
+      payload: {
+        ...response.payload,
+        reply: null
+      }
+    };
+  }
+
+  console.error("Erro ao gerar resposta:", {
+    code: error.code || "UNKNOWN",
+    status: error.httpStatus || null,
+    message: error.message
+  });
+
+  return {
+    status: 502,
+    payload: {
+      success: false,
+      reply: null,
+      code: error.code || "AI_REQUEST_ERROR",
+      message: "Não foi possível gerar a resposta da IA neste momento."
+    }
+  };
+}
+
 const server = createServer(async (req, res) => {
   setCors(res);
 
@@ -553,7 +777,7 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/health") {
     return sendJson(res, 200, {
       status: "ok",
-      service: "sette-isaque-loop-v3-diagnostico",
+      service: "sette-isaque-loop-v4-opa-responder",
       ai_mode: AI_MODE,
       openai_configured: Boolean(OPENAI_API_KEY),
       active_conversations: conversationStates.size
@@ -639,148 +863,25 @@ const server = createServer(async (req, res) => {
     }
   }
 
+  if (req.method === "POST" && url.pathname === "/api/opa/responder") {
+    try {
+      const body = await readJsonBody(req);
+      const result = await processIsaqueBody(body, true);
+      return sendJson(res, result.status, result.payload);
+    } catch (error) {
+      const response = isaqueErrorResponse(error);
+      return sendJson(res, response.status, response.payload);
+    }
+  }
+
   if (req.method === "POST" && url.pathname === "/api/isaque/responder") {
     try {
       const body = await readJsonBody(req);
-      const message = cleanMessage(body.message);
-      const sender = cleanString(body.sender, 50).toLowerCase() || "customer";
-      const conversationKey = getConversationKey(body);
-      const messageId = getMessageId(body);
-      const requestedPreviousResponseId = getPreviousResponseId(body);
-      const reset = body.reset === true || body.reset === "true";
-
-      if (!message) {
-        return sendJson(res, 400, {
-          success: false,
-          code: "MESSAGE_REQUIRED",
-          message: 'Envie o campo "message" com a mensagem do cliente.'
-        });
-      }
-
-      if (sender !== "customer" && sender !== "client" && sender !== "cliente") {
-        return sendJson(res, 200, {
-          success: true,
-          ignored: true,
-          reply: null,
-          reason: "A mensagem não foi identificada como enviada pelo cliente.",
-          sender
-        });
-      }
-
-      if (messageId && processedMessages.has(messageId)) {
-        const cached = processedMessages.get(messageId);
-        return sendJson(res, 200, {
-          ...cached.response,
-          duplicate: true
-        });
-      }
-
-      const result = await runSerialized(conversationKey, async () => {
-        if (reset && conversationKey) {
-          conversationStates.delete(conversationKey);
-        }
-
-        const currentState = conversationKey
-          ? conversationStates.get(conversationKey) || {}
-          : {};
-
-        if (AI_MODE === "openai") {
-          const previousResponseId =
-            requestedPreviousResponseId || cleanString(currentState.previousResponseId, 200);
-
-          const aiResult = await askOpenAI(message, previousResponseId);
-          const response = {
-            success: true,
-            reply: aiResult.reply,
-            response_id: aiResult.responseId || null,
-            customer_service_id: conversationKey || null,
-            message_id: messageId || null,
-            duplicate: false,
-            ai_mode: "openai",
-            context_source: requestedPreviousResponseId
-              ? "request"
-              : previousResponseId
-                ? "server_memory"
-                : "new",
-            context_reset: aiResult.contextReset,
-            model: aiResult.model
-          };
-
-          if (conversationKey) {
-            conversationStates.set(conversationKey, {
-              previousResponseId: aiResult.responseId,
-              updatedAt: Date.now()
-            });
-          }
-
-          return response;
-        }
-
-        const mockResult = mockAI(message, cleanString(currentState.mockStage, 100));
-        const response = {
-          success: true,
-          reply: mockResult.reply,
-          response_id: null,
-          customer_service_id: conversationKey || null,
-          message_id: messageId || null,
-          duplicate: false,
-          ai_mode: "mock",
-          category: mockResult.category,
-          stage: mockResult.stage,
-          context_source: conversationKey ? "server_memory" : "stateless"
-        };
-
-        if (conversationKey) {
-          conversationStates.set(conversationKey, {
-            mockStage: mockResult.stage,
-            updatedAt: Date.now()
-          });
-        }
-
-        return response;
-      });
-
-      if (messageId) {
-        processedMessages.set(messageId, {
-          response: result,
-          expiresAt: Date.now() + IDEMPOTENCY_TTL_MS
-        });
-      }
-
-      return sendJson(res, 200, result);
+      const result = await processIsaqueBody(body, false);
+      return sendJson(res, result.status, result.payload);
     } catch (error) {
-      if (error.name === "AbortError") {
-        return sendJson(res, 504, {
-          success: false,
-          code: "OPENAI_TIMEOUT",
-          message: "A IA demorou mais que o limite configurado."
-        });
-      }
-
-      if (error.code === "OPENAI_API_KEY_NOT_CONFIGURED") {
-        return sendJson(res, 503, {
-          success: false,
-          code: error.code,
-          message: "A chave da OpenAI ainda não foi configurada no servidor."
-        });
-      }
-
-      if (error.code === "BODY_TOO_LARGE" || error.code === "INVALID_JSON") {
-        const response = bodyErrorResponse(error);
-        return sendJson(res, response.status, response.payload);
-      }
-
-      console.error("Erro ao gerar resposta:", {
-        code: error.code || "UNKNOWN",
-        status: error.httpStatus || null,
-        message: error.message
-      });
-
-      return sendJson(res, 502, {
-        success: false,
-        code: error.code || "AI_REQUEST_ERROR",
-        message: "Não foi possível gerar a resposta da IA neste momento."
-      });
+      const response = isaqueErrorResponse(error);
+      return sendJson(res, response.status, response.payload);
     }
   }
 
@@ -792,11 +893,12 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`SETTE Isaque Loop v3 rodando na porta ${PORT}`);
+  console.log(`SETTE Isaque Loop v4 rodando na porta ${PORT}`);
   console.log(`Modo de IA: ${AI_MODE}`);
   console.log(`Health: http://localhost:${PORT}/health`);
   console.log(`Teste fixo: POST http://localhost:${PORT}/api/teste-opa`);
   console.log(`Diagnóstico OPA: POST http://localhost:${PORT}/api/opa/diagnostico`);
+  console.log(`Resposta simples OPA: POST http://localhost:${PORT}/api/opa/responder`);
   console.log(`Responder: POST http://localhost:${PORT}/api/isaque/responder`);
   console.log(`Reset: POST http://localhost:${PORT}/api/isaque/reset`);
 });

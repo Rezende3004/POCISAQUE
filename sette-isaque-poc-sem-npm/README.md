@@ -202,3 +202,29 @@ curl -X POST https://SEU-SERVICO.onrender.com/api/opa/diagnostico \
     "message_id_candidato":"msg-456"
   }'
 ```
+
+
+# Rota simplificada para o OPA
+
+```http
+POST /api/opa/responder
+```
+
+Body mínimo:
+
+```json
+{
+  "mensagem_cliente": "minha internet caiu"
+}
+```
+
+Retorno mínimo:
+
+```json
+{
+  "success": true,
+  "reply": "*Isaque:*\n\nEntendi 😊 O equipamento da internet está conectado à energia e com alguma luz acesa? 💙"
+}
+```
+
+A rota também aceita os campos `message`, `mensagem`, `mensagem_candidata`, `text` e `texto`.
